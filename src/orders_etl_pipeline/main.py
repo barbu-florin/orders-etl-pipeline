@@ -1,53 +1,54 @@
-import os
+from orders_etl_pipeline.db import execute_sql_file, get_engine
+from orders_etl_pipeline.config import SQL_DIR, configure_logging, get_logger
+from orders_etl_pipeline.ingest import ingest_fx_rates, ingest_orders
+from orders_etl_pipeline.utils import (
+    log_country_revenue_summary,
+    log_top_customers,
+    log_bronze_layer,
+    log_silver_layer,
+)
 
-from dotenv import load_dotenv
-
-from orders_etl_pipeline.extract.fetch_data import fetch_api_data
-from orders_etl_pipeline.database.connection import get_engine
-from orders_etl_pipeline.load.load_to_db import load_to_db
-from orders_etl_pipeline.transform.clean_orders import clean_orders
-
-load_dotenv()
+logger = get_logger(__name__)
 
 
 def main():
-    engine = get_engine()
+    configure_logging()
+    logger.info("ETL pipeline started")
 
-    orders_url = "https://jzozteoirwfczccltcdr.supabase.co/rest/v1/orders_raw"
-    fx_url = "https://api.frankfurter.dev/v2/rates"
+    try:
+        engine = get_engine()
 
-    orders_headers = {
-        "Content-Type": "application/json",
-        "apikey": os.getenv("API_KEY"),
-    }
+        # SETUP
+        logger.info("Running schema setup")
+        execute_sql_file(engine, SQL_DIR / "01_schema_setup.sql")
 
-    fx_headers = {
-        "Content-Type": "application/json",
-    }
+        # BRONZE LAYER - RAW DATA INGESTION
+        ingest_orders(engine)
+        ingest_fx_rates(engine)
+        log_bronze_layer(engine)
 
-    orders_raw_df = fetch_api_data(orders_url, orders_headers)
+        # SILVER LAYER - DATA CLEANING AND TRANSFORMATION
+        logger.info("Running silver layer transformations")
+        execute_sql_file(engine, SQL_DIR / "02_transform_orders.sql")
+        execute_sql_file(engine, SQL_DIR / "03_transform_fx_rates.sql")
+        log_silver_layer(engine)
 
-    load_to_db(
-        orders_raw_df,
-        engine,
-        table="orders_raw",
-        schema="bronze",
-    )
+        # INTERMEDIATE LAYER - APPLY FX RATES AND CALCULATE EUR VALUES ONLY ONCE
+        logger.info("Creating EUR-clean intermediate view")
+        execute_sql_file(engine, SQL_DIR / "04_vw_orders_clean_eur.sql")
 
-    orders_clean_df = clean_orders(orders_raw_df)
+        # GOLD LAYER - BUSINESS REPORTING
+        logger.info("Running gold layer reporting queries")
+        execute_sql_file(engine, SQL_DIR / "05_customer_spend_eur.sql")
+        log_top_customers(engine)
 
-    load_to_db(
-        orders_clean_df,
-        engine,
-        table="orders_clean",
-        schema="silver"
-    )
+        execute_sql_file(engine, SQL_DIR / "06_country_category_breakdown.sql")
+        log_country_revenue_summary(engine)
 
-    fx_rates = fetch_api_data(fx_url, fx_headers)
-
-    load_to_db(fx_rates, engine, table="fx_rates", schema="silver")
-
-
+        logger.info("ETL pipeline completed successfully")
+    except Exception:
+        logger.exception("ETL pipeline failed")
+        raise
 
 
 if __name__ == "__main__":
